@@ -45,6 +45,9 @@ struct nfq_handler {
 	struct nl_sock *nfqh;
 	struct nfnl_queue *nf_queue;
 	int queueno;
+	int queue_len;
+	unsigned queue_batch;
+	uint32_t queue_last_send_id;
 	int cpu;
 	struct nfq_handler_stats stats;
 	union {
@@ -57,8 +60,12 @@ struct nfq_handler {
 MY_LIST_HEAD(nfq_handler_list);
 
 static long first_queueno, last_queueno;
+static unsigned g_queue_len = DEFAULT_QUEUE_LEN;
+static unsigned g_queue_batch = 1;
 static int family = AF_INET;
 static struct option lopts[] = {
+	[0] = { "queue-len", required_argument, NULL, 0 },
+	[1] = { "batch", required_argument, NULL, 0 },
     { "affinity", required_argument, NULL, 'a' },
     { "debug", no_argument, NULL, 'd' },
     { "forked", no_argument, NULL, 'f' },
@@ -118,14 +125,25 @@ check_opts(int argc, char *argv[])
 	char *end;
 
     do {
-        int c = getopt_long(argc, argv, "a:dfhq:v", lopts, NULL);
-		
-        if (c == EOF)
-            break;
-		
-        if (c == 0) {
-            /* handle long opts */
-            continue;
+		int idx, c;
+
+		if ((c = getopt_long(argc, argv, "a:dfhq:v", lopts, &idx)) == EOF)
+			break;
+        else if (c == 0) {
+			switch (idx) {
+			case 0:
+				g_queue_len = strtoul(optarg, &end, 10);
+				if (*end)
+					die("queue-len: %s: garbage in input", optarg);
+				break;
+
+			case 1:
+				g_queue_batch = strtoul(optarg, &end, 10);
+				if (*end)
+					die("batch: %s: garbage in input", optarg);
+			}
+
+			continue;
         }
 
         /* handle short opts */
@@ -198,13 +216,26 @@ nfq_recv_valid_cb(struct nl_object *obj, void *arg)
 			.dp_dump_msgtype = 1,
 		};
 
+		/* FIXME this requires rtnl/link cache to be filled */
 		nl_object_dump(obj, &dp);
 	}
 
-	nfnl_queue_msg_set_verdict(msg, NF_ACCEPT);
+	if (qh->queue_batch > 1) {
+		const uint32_t id = nfnl_queue_msg_get_packetid(msg);
+		
+		if (id >= qh->queue_last_send_id + qh->queue_batch) {
+			nfnl_queue_msg_set_verdict(msg, NF_ACCEPT);
 
-	if ((ret = nfnl_queue_msg_send_verdict(qh->nfqh, msg)) < 0)
-		xlog("nfnl_queue_msg_send_verdict: %s", nl_geterror(ret));
+			qh->queue_last_send_id = id;
+			if ((ret = nfnl_queue_msg_send_verdict_batch(qh->nfqh, msg)) < 0)
+				xlog("nfnl_queue_msg_send_verdict: %s", nl_geterror(ret));
+		}
+	} else {
+		nfnl_queue_msg_set_verdict(msg, NF_ACCEPT);
+
+		if ((ret = nfnl_queue_msg_send_verdict(qh->nfqh, msg)) < 0)
+			xlog("nfnl_queue_msg_send_verdict: %s", nl_geterror(ret));
+	}
 }
  
 static int
@@ -302,6 +333,8 @@ nfq_handler_init(struct nfq_handler *qh)
 	nfnl_queue_set_group(qh->nf_queue, qh->queueno);
 	nfnl_queue_set_copy_mode(qh->nf_queue, NFNL_QUEUE_COPY_PACKET);
 	nfnl_queue_set_copy_range(qh->nf_queue, 0xffff);
+	if (g_queue_len > 0)
+		nfnl_queue_set_maxlen(qh->nf_queue, qh->queue_len);
 
 	if ((ret = nfnl_queue_create(qh->nfqh, qh->nf_queue)) < 0) {
 		xlog("nfnl_queue_create: %s", nl_geterror(ret));
@@ -322,7 +355,7 @@ err:
 }
 
 static struct nfq_handler *
-nfq_handler_alloc(int queueno)
+nfq_handler_alloc(int queueno, int queue_len, int queue_batch)
 {
 	struct nfq_handler *qh;
 
@@ -332,6 +365,8 @@ nfq_handler_alloc(int queueno)
 	}
 
 	qh->queueno = queueno;
+	qh->queue_len = queue_len;
+	qh->queue_batch = queue_batch;
 	qh->cpu = -1;
 	nfq_handler_stats_init(&qh->stats);
 
@@ -382,7 +417,8 @@ nfq_handler_dump_all(void)
 static int
 single_queue(int queueno)
 {
-	struct nfq_handler *qh = nfq_handler_alloc(queueno);
+	struct nfq_handler *qh = nfq_handler_alloc(queueno, g_queue_len,
+											   g_queue_batch);
 
 	nfq_handler_init(qh);
 
@@ -410,7 +446,8 @@ init_mt_queues(int firstq, int lastq)
 
 	cpu = affinity_first_cpu;
 	for (queueno = firstq; queueno <= lastq; queueno++, cpu++) {
-		struct nfq_handler *qh = nfq_handler_alloc(queueno);
+		struct nfq_handler *qh = nfq_handler_alloc(queueno, g_queue_len,
+												   g_queue_batch);
 		int ret;
 
 		if (!qh)
@@ -435,9 +472,10 @@ init_mt_queues(int firstq, int lastq)
 				xerr("pthread_setaffinity: %s", strerror(-ret));
 				goto err;
 			}
-
-			xlog("Initialized nfqueue %d (inet, inet6)", qh->queueno);
 		}
+
+		xlog("Initialized nfqueue %d (inet, inet6, len %d, batch %d)",
+			 qh->queueno, qh->queue_len, qh->queue_batch);
 	}
 
 	return 0;
@@ -455,7 +493,8 @@ init_forked_queues(int firstq, int lastq)
 	xlog("initializing forked queues");
 
 	for (queueno = firstq; queueno <= lastq; queueno++) {
-		struct nfq_handler *qh = nfq_handler_alloc(queueno);
+		struct nfq_handler *qh = nfq_handler_alloc(queueno, g_queue_len,
+												   g_queue_batch);
 		pid_t child_pid;
 
 		if (!qh)
