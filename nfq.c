@@ -30,6 +30,8 @@
 #include "list.h"
 #include "event.h"
 
+#define DEFAULT_QUEUE_LEN		2048
+
 #ifndef SOL_NETLINK
 #define SOL_NETLINK 270
 #endif
@@ -38,6 +40,8 @@ struct nfq_handler_stats {
 	pthread_mutex_t nfqs_lock;
 	uint64_t nfqs_bytes;
 	uint64_t nfqs_pkts;
+	uint64_t nfqs_overrun;
+	uint64_t nfqs_err;
 };
 
 struct nfq_handler {
@@ -253,7 +257,11 @@ nfq_event_cb(struct nl_msg *msg, void *arg)
 static int
 nfq_overrun_cb(struct nl_msg *msg, void *arg)
 {
-	struct nfq_handler *qh __UNUSED = arg;
+	struct nfq_handler *qh = arg;
+
+	pthread_mutex_lock(&qh->stats.nfqs_lock);
+	qh->stats.nfqs_overrun++;
+	pthread_mutex_unlock(&qh->stats.nfqs_lock);
 
 	return NL_SKIP;
 }
@@ -261,7 +269,11 @@ nfq_overrun_cb(struct nl_msg *msg, void *arg)
 static int
 nfq_err_cb(struct sockaddr_nl *sa, struct nlmsgerr *e, void *arg)
 {
-	struct nfq_handler *qh __UNUSED = arg;
+	struct nfq_handler *qh = arg;
+
+	pthread_mutex_lock(&qh->stats.nfqs_lock);
+	qh->stats.nfqs_err++;
+	pthread_mutex_unlock(&qh->stats.nfqs_lock);
 
 	return NL_SKIP;
 }
@@ -408,8 +420,9 @@ nfq_handler_dump_all(void)
 		struct nfq_handler_stats *stats = &qh->stats;
 
 		pthread_mutex_lock(&stats->nfqs_lock);
-		xlog("q[%d]: bytes=%llu pkts=%llu", qh->queueno,
-			 stats->nfqs_bytes, stats->nfqs_pkts);
+		xlog("q[%d]: bytes=%llu pkts=%llu err=%llu ovrrun=%llu", qh->queueno,
+			 stats->nfqs_bytes, stats->nfqs_pkts, stats->nfqs_err,
+			 stats->nfqs_overrun);
 		pthread_mutex_unlock(&stats->nfqs_lock);
 	}
 }
