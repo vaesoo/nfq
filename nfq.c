@@ -42,6 +42,7 @@ struct nfq_handler_stats {
 	uint64_t nfqs_pkts;
 	uint64_t nfqs_overrun;
 	uint64_t nfqs_err;
+	uint32_t nfqs_verd[NF_MAX_VERDICT];
 };
 
 struct nfq_handler {
@@ -66,10 +67,12 @@ MY_LIST_HEAD(nfq_handler_list);
 static long first_queueno, last_queueno;
 static unsigned g_queue_len = DEFAULT_QUEUE_LEN;
 static unsigned g_queue_batch = 1;
+static int g_verdict = NF_ACCEPT;
 static int family = AF_INET;
 static struct option lopts[] = {
 	[0] = { "queue-len", required_argument, NULL, 0 },
 	[1] = { "batch", required_argument, NULL, 0 },
+	[2] = { "verdict", required_argument, NULL, 0 },
     { "affinity", required_argument, NULL, 'a' },
     { "debug", no_argument, NULL, 'd' },
     { "forked", no_argument, NULL, 'f' },
@@ -103,6 +106,25 @@ f2s(int family)
 	}
 
 	return NULL;
+}
+
+static int
+verdict_str2num(const char *str)
+{
+	static const char *verdicts[] = {
+		[NF_DROP] = "DROP",
+		[NF_ACCEPT] = "ACCEPT",
+	};
+	int i;
+
+	/* there are more verdicts than than (e. g. NF_STOLEN).  However,
+	   those two here are typically used with a program using
+	   NFQUUE */
+	for (i = 0; i < ARRAY_SIZE(verdicts); i++)
+		if (strcasecmp(str, verdicts[i]) == 0)
+			return i;
+
+	return -1;
 }
 
 static int
@@ -145,6 +167,11 @@ check_opts(int argc, char *argv[])
 				g_queue_batch = strtoul(optarg, &end, 10);
 				if (*end)
 					die("batch: %s: garbage in input", optarg);
+
+			case 2:				/* --verdict */
+				g_verdict = verdict_str2num(optarg);
+				if (g_verdict < 0)
+					die("%s: invalid verdict", optarg);
 			}
 
 			continue;
@@ -228,14 +255,16 @@ nfq_recv_valid_cb(struct nl_object *obj, void *arg)
 		const uint32_t id = nfnl_queue_msg_get_packetid(msg);
 		
 		if (id >= qh->queue_last_send_id + qh->queue_batch) {
-			nfnl_queue_msg_set_verdict(msg, NF_ACCEPT);
+			nfnl_queue_msg_set_verdict(msg, g_verdict);
+			qh->stats.nfqs_verd[g_verdict]++;
 
 			qh->queue_last_send_id = id;
 			if ((ret = nfnl_queue_msg_send_verdict_batch(qh->nfqh, msg)) < 0)
 				xlog("nfnl_queue_msg_send_verdict: %s", nl_geterror(ret));
 		}
 	} else {
-		nfnl_queue_msg_set_verdict(msg, NF_ACCEPT);
+		nfnl_queue_msg_set_verdict(msg, g_verdict);
+		qh->stats.nfqs_verd[g_verdict]++;
 
 		if ((ret = nfnl_queue_msg_send_verdict(qh->nfqh, msg)) < 0)
 			xlog("nfnl_queue_msg_send_verdict: %s", nl_geterror(ret));
@@ -417,13 +446,15 @@ nfq_handler_dump_all(void)
 	struct nfq_handler *qh;
 
 	list_for_each_entry(qh, &nfq_handler_list, link) {
-		struct nfq_handler_stats *stats = &qh->stats;
+		struct nfq_handler_stats *s = &qh->stats;
 
-		pthread_mutex_lock(&stats->nfqs_lock);
-		xlog("q[%d]: bytes=%llu pkts=%llu err=%llu ovrrun=%llu", qh->queueno,
-			 stats->nfqs_bytes, stats->nfqs_pkts, stats->nfqs_err,
-			 stats->nfqs_overrun);
-		pthread_mutex_unlock(&stats->nfqs_lock);
+		pthread_mutex_lock(&s->nfqs_lock);
+		xlog("q[%d]: bytes=%llu pkts=%llu err=%llu ovrrun=%llu "
+			 "[%u %u]", qh->queueno,
+			 s->nfqs_bytes, s->nfqs_pkts, s->nfqs_err,
+			 s->nfqs_overrun, s->nfqs_verd[0],
+			 s->nfqs_verd[1]);
+		pthread_mutex_unlock(&s->nfqs_lock);
 	}
 }
 

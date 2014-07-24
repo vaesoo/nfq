@@ -20,6 +20,8 @@
 
 #define BUG()			abort()
 
+#define ARRAY_SIZE(arr)	(sizeof(arr) / sizeof(arr[0]))
+
 void die(const char *fmt, ...) __COLD __PRINTF(1, 2);
 void xerr(const char *fmt, ...) __COLD __PRINTF(1, 2);
 void xlog(const char *fmt, ...);
